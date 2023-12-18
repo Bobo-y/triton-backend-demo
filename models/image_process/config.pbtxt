@@ -1,0 +1,60 @@
+backend: "image_process"
+max_batch_size: 8
+input [
+  {
+    name: "image_path"
+    data_type: TYPE_STRING
+    dims: [1]
+  }
+]
+
+output [
+  {
+    name: "image"
+    data_type: TYPE_FP32
+    dims: [224, 224, 3]
+  }
+]
+
+parameters {
+  key: "mean_R"
+  value: {
+    string_value: "128"
+  }
+}
+parameters {
+  key: "mean_G"
+  value: {
+    string_value: "128"
+  }
+}
+parameters {
+  key: "mean_B"
+  value: {
+    string_value: "128"
+  }
+}
+parameters {
+  key: "std_R"
+  value: {
+    string_value: "128"
+  }
+}
+parameters {
+  key: "std_G"
+  value: {
+    string_value: "128"
+  }
+}
+parameters {
+  key: "std_B"
+  value: {
+    string_value: "128"
+  }
+}
+instance_group [
+  {
+    kind: KIND_GPU
+  }
+]
+ 
