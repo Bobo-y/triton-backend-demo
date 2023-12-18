@@ -6,6 +6,7 @@ sudo docker run --gpus all -it -v /home/:/home/ -p 8000:8000 -p 8001:8001 -p 800
 
 
 # cd image_process dir
+# in docker
 mkdir build & cd build
 cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install ..
 make install -j8
@@ -19,8 +20,9 @@ make install -j8
 ```
 
 2. start custom backend server
-# in docker
+
 ```shell
+# in docker
 # cd /opt/tritonserver
 cp /home/XXX/backend_demo/image_process/build/libimageprocess.so /opt/tritonserver/backends/image_process/
 mv /opt/tritonserver/backends/image_process/libimageprocess.so /opt/tritonserver/backends/image_process/libtriton_image_process.so
