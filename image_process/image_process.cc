@@ -12,6 +12,46 @@
 
 namespace triton { namespace backend { namespace image_process {
 
+#define RESPOND_AND_RETURN_IF_ERROR(REQUEST, X)                         \
+  do {                                                                  \
+    TRITONSERVER_Error* rarie_err__ = (X);                              \
+    if (rarie_err__ != nullptr) {                                       \
+      TRITONBACKEND_Response* rarie_response__ = nullptr;               \
+      LOG_IF_ERROR(                                                     \
+          TRITONBACKEND_ResponseNew(&rarie_response__, REQUEST),        \
+          "failed to create response");                                 \
+      if (rarie_response__ != nullptr) {                                \
+        LOG_IF_ERROR(                                                   \
+            TRITONBACKEND_ResponseSend(                                 \
+                rarie_response__, TRITONSERVER_RESPONSE_COMPLETE_FINAL, \
+                rarie_err__),                                           \
+            "failed to send error response");                           \
+      }                                                                 \
+      TRITONSERVER_ErrorDelete(rarie_err__);                            \
+      return rarie_err__;                                               \
+    }                                                                   \
+  } while (false)                                                       \
+
+
+#define RESPOND_FACTORY_AND_RETURN_IF_ERROR(FACTORY, X)                      \
+  do {                                                                       \
+    TRITONSERVER_Error* rfarie_err__ = (X);                                  \
+    if (rfarie_err__ != nullptr) {                                           \
+      TRITONBACKEND_Response* rfarie_response__ = nullptr;                   \
+      LOG_IF_ERROR(                                                          \
+          TRITONBACKEND_ResponseNewFromFactory(&rfarie_response__, FACTORY), \
+          "failed to create response");                                      \
+      if (rfarie_response__ != nullptr) {                                    \
+        LOG_IF_ERROR(                                                        \
+            TRITONBACKEND_ResponseSend(                                      \
+                rfarie_response__, TRITONSERVER_RESPONSE_COMPLETE_FINAL,     \
+                rfarie_err__),                                               \
+            "failed to send error response");                                \
+      }                                                                      \
+      TRITONSERVER_ErrorDelete(rfarie_err__);                                \
+      return rfarie_err__;                                                    \
+    }                                                                        \
+  } while (false)   
 
 extern "C" {
 TRITONSERVER_Error*
@@ -416,116 +456,125 @@ TRITONBACKEND_ModelInstanceExecute(
 
   std::vector<TRITONBACKEND_Response*> responses;
   responses.reserve(request_count);
-  for (uint32_t r = 0; r < request_count; ++r) {
-    TRITONBACKEND_Request* request = requests[r];
-    TRITONBACKEND_Response* response;
-    RETURN_IF_ERROR(TRITONBACKEND_ResponseNew(&response, request));
-    responses.push_back(response);
-  }
 
-  BackendInputCollector collector(
-      requests, request_count, &responses, model_state->TritonMemoryManager(),
-      false /* pinned_enabled */, nullptr /* stream*/);
-
-  std::vector<std::pair<TRITONSERVER_MemoryType, int64_t>> allowed_input_types =
-      {{TRITONSERVER_MEMORY_CPU_PINNED, 0}, {TRITONSERVER_MEMORY_CPU, 0}};
-  const char* input_buffer;
-  size_t input_buffer_byte_size;
-  TRITONSERVER_MemoryType input_buffer_memory_type;
-  int64_t input_buffer_memory_type_id;
-  RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-      responses, request_count,
-      collector.ProcessTensor(
-          model_state->InputTensorName().c_str(), nullptr /* existing_buffer */,
-          0 /* existing_buffer_byte_size */, allowed_input_types, &input_buffer,
-          &input_buffer_byte_size, &input_buffer_memory_type,
-          &input_buffer_memory_type_id));
-  const bool need_cuda_input_sync = collector.Finalize();
-  if (need_cuda_input_sync) {
-    LOG_MESSAGE(
-        TRITONSERVER_LOG_ERROR,
-        "'recommended' backend: unexpected CUDA sync required by collector");
-  }
-
-  uint64_t compute_start_ns = 0;
-  SET_TIMESTAMP(compute_start_ns);
   bool supports_first_dim_batching;
-  RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-      responses, request_count,
-      model_state->SupportsFirstDimBatching(&supports_first_dim_batching));
-  std::vector<std::string> image_paths;
-  RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-      responses, request_count,
-    FindVaildPath(input_buffer, input_buffer_byte_size, supports_first_dim_batching, image_paths));
-  for(size_t id=0; id< image_paths.size(); id++){
-    LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO, image_paths[id].c_str());
-  }
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO,
-      (std::string("model ") + model_state->Name() + ": requests count: " +
-       std::to_string(request_count) + "batchsize:" + std::to_string(image_paths.size()))
-          .c_str());
+
+  model_state->SupportsFirstDimBatching(&supports_first_dim_batching);
 
   size_t dst_c =  model_state->TargetShape()[2];
   size_t dst_h =  model_state->TargetShape()[0];
   size_t dst_w =  model_state->TargetShape()[1];
-  size_t output_size = dst_c * dst_h *dst_w;
-  float* data = (float*)malloc(sizeof(float) * output_size * image_paths.size());
-  for(size_t ii=0; ii < image_paths.size(); ii++){
-    std::string image_path = image_paths[ii];
-    cv::Mat img = cv::imread(image_path);
-    cv::resize(img, img, cv::Size(dst_w, dst_h));
-    cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
-    for(int row=0; row < img.rows; row ++){
-      for(int col=0; col < img.cols; col ++){
-        cv::Vec3f val = img.at<cv::Vec3f>(row, col);
-        val[0] = (val[0] - model_state->NormMean().x) / model_state->NormStd().x;
-        val[1] = (val[1] - model_state->NormMean().y) / model_state->NormStd().y;
-        val[2] = (val[2] - model_state->NormMean().z) / model_state->NormStd().z;
-        data[ii * output_size + row * dst_w *dst_c + col * dst_c] = val[0];
-        data[ii * output_size + row * dst_w *dst_c + col * dst_c + 1] = val[1];
-        data[ii * output_size + row * dst_w *dst_c + col * dst_c + 2] = val[2];
+  size_t output_size = dst_c * dst_h * dst_w;
+
+  uint64_t compute_start_ns = 0;
+  SET_TIMESTAMP(compute_start_ns);
+  for(uint32_t r= 0; r < request_count; ++r){
+    TRITONBACKEND_Request* request = requests[r];
+    // TRITONBACKEND_Response* response = responses[r];
+    TRITONBACKEND_ResponseFactory* factory_ptr;
+    RESPOND_AND_RETURN_IF_ERROR(
+      request, TRITONBACKEND_ResponseFactoryNew(&factory_ptr, request));
+    std::unique_ptr<TRITONBACKEND_ResponseFactory, backend::ResponseFactoryDeleter> factory(factory_ptr);
+    // prepare input
+    std::vector<std::string> image_paths;
+    TRITONBACKEND_Input* in;
+    RESPOND_AND_RETURN_IF_ERROR(
+      request, TRITONBACKEND_RequestInput(request, "image_path", &in));
+
+    const int64_t* in_shape_arr;
+    uint32_t in_dims_count;
+    uint64_t in_byte_size;
+    RESPOND_AND_RETURN_IF_ERROR(
+        request, TRITONBACKEND_InputProperties(
+                    in, nullptr, nullptr, &in_shape_arr, &in_dims_count,
+                    &in_byte_size, nullptr));
+    std::vector<int64_t> in_shape(in_shape_arr, in_shape_arr + in_dims_count);
+
+    const uint32_t element_count = in_byte_size;
+    char* in_buffer = new char[element_count];
+    RESPOND_AND_RETURN_IF_ERROR(
+        request, backend::ReadInputTensor(
+                    request, "image_path", in_buffer, &in_byte_size));
+    RESPOND_AND_RETURN_IF_ERROR(
+        request, FindVaildPath(in_buffer, in_byte_size, supports_first_dim_batching, image_paths));
+
+    for(size_t i=0; i< image_paths.size(); i++){
+      LOG_MESSAGE(
+        TRITONSERVER_LOG_INFO, image_paths[i].c_str());
+    }
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_INFO,
+        (std::string("model ") + model_state->Name() + ": requests count: " +
+        std::to_string(request_count) + "batchsize:" + std::to_string(image_paths.size()))
+            .c_str());
+
+    // process ouput 
+    TRITONBACKEND_Output* out;
+    TRITONBACKEND_Response* response;
+    responses.push_back(response);
+    RESPOND_FACTORY_AND_RETURN_IF_ERROR(
+        factory.get(),
+        TRITONBACKEND_ResponseNewFromFactory(&response, factory.get()));
+
+    float* data = (float*)malloc(sizeof(float) * output_size * image_paths.size());
+    const int64_t* out_shape;
+    size_t dims;
+    if(supports_first_dim_batching){
+      out_shape = new int64_t[]{int64_t(image_paths.size()), int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
+      dims = model_state->TargetShape().size() + 1;
+    }else{
+      out_shape = new int64_t[]{int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
+      dims = model_state->TargetShape().size();
+    }
+
+    RESPOND_FACTORY_AND_RETURN_IF_ERROR(
+        factory.get(), TRITONBACKEND_ResponseOutput(
+                           response, &out, "image", TRITONSERVER_TYPE_FP32,
+                           out_shape, dims));
+    delete []out_shape;
+    void* out_buffer;
+    TRITONSERVER_MemoryType out_memory_type = TRITONSERVER_MEMORY_CPU;
+    int64_t out_memory_type_id = 0;
+
+    RESPOND_FACTORY_AND_RETURN_IF_ERROR(
+        factory.get(), TRITONBACKEND_OutputBuffer(
+                           out, &out_buffer, sizeof(float) * output_size * image_paths.size(), &out_memory_type,
+                           &out_memory_type_id));
+
+    if (out_memory_type == TRITONSERVER_MEMORY_GPU) {
+      RESPOND_FACTORY_AND_RETURN_IF_ERROR(
+          factory.get(),
+          TRITONSERVER_ErrorNew(
+              TRITONSERVER_ERROR_INTERNAL,
+              "failed to create OUT output buffer in CPU memory"));
+    }
+
+    for(size_t ii=0; ii < image_paths.size(); ii++){
+      std::string image_path = image_paths[ii];
+      cv::Mat img = cv::imread(image_path);
+      cv::resize(img, img, cv::Size(dst_w, dst_h));
+      cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+      for(int row=0; row < img.rows; row ++){
+        for(int col=0; col < img.cols; col ++){
+          cv::Vec3b val = img.at<cv::Vec3b>(row, col);
+          float r = (val[0] - model_state->NormMean().x) / model_state->NormStd().x;
+          float g = (val[1] - model_state->NormMean().y) / model_state->NormStd().y;
+          float b = (val[2] - model_state->NormMean().z) / model_state->NormStd().z;
+          data[ii * output_size + row * dst_w *dst_c + col * dst_c] = r;
+          data[ii * output_size + row * dst_w *dst_c + col * dst_c + 1] = g;
+          data[ii * output_size + row * dst_w *dst_c + col * dst_c + 2] = b;
+        }
       }
     }
+    memcpy(out_buffer, data, sizeof(float) * output_size * image_paths.size());
+    LOG_IF_ERROR(
+          TRITONBACKEND_ResponseSend(
+              response, TRITONSERVER_RESPONSE_COMPLETE_FINAL /* flags */, nullptr /* success */),
+          "failed sending response");
   }
-
-  const char* output_buffer = reinterpret_cast<const char *>(data);
-  TRITONSERVER_MemoryType output_buffer_memory_type = TRITONSERVER_MEMORY_CPU;
-  int64_t output_buffer_memory_type_id = 0;
+  
   uint64_t compute_end_ns = 0;
   SET_TIMESTAMP(compute_end_ns);
-  std::vector<int64_t> tensor_shape;
-  RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-      responses, request_count, model_state->TensorShape(tensor_shape));
-  if(supports_first_dim_batching){
-    tensor_shape.insert(tensor_shape.begin(), image_paths.size());
-  }
-  BackendOutputResponder responder(
-      requests, request_count, &responses, model_state->TritonMemoryManager(),
-      supports_first_dim_batching, false /* pinned_enabled */,
-      nullptr /* stream*/);
-
-  responder.ProcessTensor(
-      model_state->OutputTensorName(), model_state->TensorOutDataType(),
-      tensor_shape, output_buffer, output_buffer_memory_type,
-      output_buffer_memory_type_id);
-
-  const bool need_cuda_output_sync = responder.Finalize();
-  if (need_cuda_output_sync) {
-    LOG_MESSAGE(
-        TRITONSERVER_LOG_ERROR,
-        "'recommended' backend: unexpected CUDA sync required by responder");
-  }
-  for (auto& response : responses) {
-    if (response != nullptr) {
-      LOG_IF_ERROR(
-          TRITONBACKEND_ResponseSend(
-              response, TRITONSERVER_RESPONSE_COMPLETE_FINAL, nullptr),
-          "failed to send response");
-    }
-  }
-
   uint64_t exec_end_ns = 0;
   SET_TIMESTAMP(exec_end_ns);
 
@@ -570,8 +619,7 @@ TRITONBACKEND_ModelInstanceExecute(
             (responses[r] != nullptr) /* success */, exec_start_ns,
             compute_start_ns, compute_end_ns, exec_end_ns),
         "failed reporting request statistics");
-#endif  // TRITON_ENABLE_STATS
-
+#endif  // TRITON_ENABLE_STAT
     LOG_IF_ERROR(
         TRITONBACKEND_RequestRelease(request, TRITONSERVER_REQUEST_RELEASE_ALL),
         "failed releasing request");
