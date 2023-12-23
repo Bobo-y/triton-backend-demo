@@ -7,10 +7,12 @@ sudo docker run --gpus all -it -v /home/:/home/ -p 8000:8000 -p 8001:8001 -p 800
 
 # cd image_process dir
 # in docker
-mkdir build & cd build
+mkdir build
+cd build
 cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install ..
 make install -j8
 
+# the cuda version not work now.
 # for debug cuda kernel
 mv image_process.cc image_process.cc.bak
 mv image_process_cuda.cc  image_process.cc
