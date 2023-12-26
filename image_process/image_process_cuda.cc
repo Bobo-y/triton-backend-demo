@@ -1,3 +1,7 @@
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <thread>
 #include "triton/backend/backend_common.h"
 #include "triton/backend/backend_input_collector.h"
 #include "triton/backend/backend_model.h"
@@ -11,6 +15,46 @@
 #include <cuda_runtime.h>
 
 namespace triton { namespace backend { namespace image_process {
+#define RESPOND_AND_RETURN_IF_ERROR(REQUEST, X)                         \
+  do {                                                                  \
+    TRITONSERVER_Error* rarie_err__ = (X);                              \
+    if (rarie_err__ != nullptr) {                                       \
+      TRITONBACKEND_Response* rarie_response__ = nullptr;               \
+      LOG_IF_ERROR(                                                     \
+          TRITONBACKEND_ResponseNew(&rarie_response__, REQUEST),        \
+          "failed to create response");                                 \
+      if (rarie_response__ != nullptr) {                                \
+        LOG_IF_ERROR(                                                   \
+            TRITONBACKEND_ResponseSend(                                 \
+                rarie_response__, TRITONSERVER_RESPONSE_COMPLETE_FINAL, \
+                rarie_err__),                                           \
+            "failed to send error response");                           \
+      }                                                                 \
+      TRITONSERVER_ErrorDelete(rarie_err__);                            \
+      return;                                               \
+    }                                                                   \
+  } while (false)                                                       \
+
+
+#define RESPOND_FACTORY_AND_RETURN_IF_ERROR(FACTORY, X)                      \
+  do {                                                                       \
+    TRITONSERVER_Error* rfarie_err__ = (X);                                  \
+    if (rfarie_err__ != nullptr) {                                           \
+      TRITONBACKEND_Response* rfarie_response__ = nullptr;                   \
+      LOG_IF_ERROR(                                                          \
+          TRITONBACKEND_ResponseNewFromFactory(&rfarie_response__, FACTORY), \
+          "failed to create response");                                      \
+      if (rfarie_response__ != nullptr) {                                    \
+        LOG_IF_ERROR(                                                        \
+            TRITONBACKEND_ResponseSend(                                      \
+                rfarie_response__, TRITONSERVER_RESPONSE_COMPLETE_FINAL,     \
+                rfarie_err__),                                               \
+            "failed to send error response");                                \
+      }                                                                      \
+      TRITONSERVER_ErrorDelete(rfarie_err__);                                \
+      return;                                                    \
+    }                                                                        \
+  } while (false)                                                            \
 
 
 extern "C" {
@@ -61,8 +105,6 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
       TRITONSERVER_LOG_INFO,
       (std::string("backend configuration:\n") + buffer).c_str());
 
-  // This backend does not require any "global" state but as an
-  // example create a string to demonstrate.
   std::string* state = new std::string("backend state");
   RETURN_IF_ERROR(
       TRITONBACKEND_BackendSetState(backend, reinterpret_cast<void*>(state)));
@@ -73,7 +115,6 @@ TRITONBACKEND_Initialize(TRITONBACKEND_Backend* backend)
 TRITONSERVER_Error*
 TRITONBACKEND_Finalize(TRITONBACKEND_Backend* backend)
 {
-  // Delete the "global" state associated with the backend.
   void* vstate;
   RETURN_IF_ERROR(TRITONBACKEND_BackendState(backend, &vstate));
   std::string* state = reinterpret_cast<std::string*>(vstate);
@@ -114,6 +155,8 @@ class ModelState : public BackendModel {
   TRITONSERVER_Error* TensorShape(std::vector<int64_t>& shape);
 
   TRITONSERVER_Error* ValidateModelConfig();
+
+
 
  private:
   ModelState(TRITONBACKEND_Model* triton_model);
@@ -174,7 +217,6 @@ ModelState::ValidateModelConfig()
   RETURN_IF_ERROR(ModelConfig().MemberAsArray("output", &outputs));
   RETURN_ERROR_IF_FALSE(ModelConfig().Find("parameters", &parameters), TRITONSERVER_ERROR_INVALID_ARG,
       std::string("model config find parameter error"));
-  // The model must have exactly 1 input and 1 output.
   RETURN_ERROR_IF_FALSE(
       inputs.ArraySize() == 1, TRITONSERVER_ERROR_INVALID_ARG,
       std::string("model configuration must have 1 input"));
@@ -289,20 +331,31 @@ class ModelInstanceState : public BackendModelInstance {
       ModelState* model_state,
       TRITONBACKEND_ModelInstance* triton_model_instance,
       ModelInstanceState** state);
-  virtual ~ModelInstanceState() = default;
+  ~ModelInstanceState(){
+    while (inflight_thread_count_ > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  };
 
   ModelState* StateForModel() const { return model_state_; }
+  void ProcessRequest(TRITONBACKEND_Request* request, bool supports_first_dim_batching);
 
  private:
+  void ResponseThread(
+      TRITONBACKEND_ResponseFactory* factory_ptr, std::vector<std::string> image_paths, bool supports_first_dim_batching);
+  TRITONSERVER_Error* FindVaildPath(const char * char_arr, size_t& char_byte_size, bool supports_first_dim_batching, std::vector<std::string>& image_paths);
+  bool isFileExists_access(std::string name);
+  cv::Mat hwc2chw(cv::Mat image);
   ModelInstanceState(
       ModelState* model_state,
       TRITONBACKEND_ModelInstance* triton_model_instance)
       : BackendModelInstance(model_state, triton_model_instance),
-        model_state_(model_state)
+        model_state_(model_state), inflight_thread_count_(0)
   {
   }
 
   ModelState* model_state_;
+  std::atomic<size_t> inflight_thread_count_;
 };
 
 TRITONSERVER_Error*
@@ -321,6 +374,177 @@ ModelInstanceState::Create(
   }
 
   return nullptr;  // success
+}
+
+bool ModelInstanceState::isFileExists_access(std::string name) {
+    return (access(name.c_str(), F_OK ) != -1 );
+}
+
+cv::Mat ModelInstanceState::hwc2chw(cv::Mat image){
+    std::vector<cv::Mat> rgb_images;
+    cv::split(image, rgb_images);
+    cv::Mat m_flat_r = rgb_images[0].reshape(1,1);
+    cv::Mat m_flat_g = rgb_images[1].reshape(1,1);
+    cv::Mat m_flat_b = rgb_images[2].reshape(1,1);
+    cv::Mat matArray[] = { m_flat_r, m_flat_g, m_flat_b};
+    cv::Mat flat_image;
+    cv::hconcat(matArray, 3, flat_image);
+    return flat_image;
+}
+
+TRITONSERVER_Error* ModelInstanceState::FindVaildPath(const char * char_arr, size_t& char_byte_size, bool supports_first_dim_batching, std::vector<std::string>& image_paths){
+  if(supports_first_dim_batching){
+    size_t ii=0;
+    size_t start_idx = 0;
+    while(ii < char_byte_size){
+      if(char_arr[ii] == '/'){
+        start_idx = ii;
+        while((ii + 3) < char_byte_size){
+          if(std::string(char_arr + ii + 1, char_arr + ii + 4) == "jpg"){
+            std::string file_path = std::string(char_arr + start_idx, char_arr + ii + 4);
+            if(!isFileExists_access(file_path)){
+              return TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_NOT_FOUND,
+            "input file path not exists");
+            }
+            image_paths.push_back(file_path);
+            ii = ii + 3;
+            break;
+          }else{
+            ii ++;
+          }
+        }
+      }
+      ii ++;
+    }
+  }else{
+    size_t ii =0; 
+    for(; ii< char_byte_size; ii++){
+      if(char_arr[ii] == '/'){
+        break;
+      }
+    }
+    std::string s(char_arr + ii, char_arr + char_byte_size);
+    image_paths.push_back(s);
+  }
+  return nullptr;
+}
+
+void ModelInstanceState::ProcessRequest(TRITONBACKEND_Request* request, bool supports_first_dim_batching){
+  // prepare input
+  std::vector<std::string> image_paths;
+  TRITONBACKEND_Input* in;
+  RESPOND_AND_RETURN_IF_ERROR(
+    request, TRITONBACKEND_RequestInput(request, "image_path", &in));
+
+  const int64_t* in_shape_arr;
+  uint32_t in_dims_count;
+  uint64_t in_byte_size;
+  RESPOND_AND_RETURN_IF_ERROR(
+    request, TRITONBACKEND_InputProperties(
+                    in, nullptr, nullptr, &in_shape_arr, &in_dims_count,
+                    &in_byte_size, nullptr));
+  std::vector<int64_t> in_shape(in_shape_arr, in_shape_arr + in_dims_count);
+
+  char* in_buffer = new char[in_byte_size];
+  RESPOND_AND_RETURN_IF_ERROR(
+    request, backend::ReadInputTensor(
+                    request, "image_path", in_buffer, &in_byte_size));
+  RESPOND_AND_RETURN_IF_ERROR(
+    request, FindVaildPath(in_buffer, in_byte_size, supports_first_dim_batching, image_paths));
+
+  for(size_t i=0; i< image_paths.size(); i++){
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO, image_paths[i].c_str());
+  }
+  LOG_MESSAGE(
+    TRITONSERVER_LOG_INFO,
+    (std::string("model ") + model_state_->Name() + "batchsize:" + std::to_string(image_paths.size())).c_str());
+  TRITONBACKEND_ResponseFactory* factory_ptr;
+  RESPOND_AND_RETURN_IF_ERROR(
+    request, TRITONBACKEND_ResponseFactoryNew(&factory_ptr, request));
+  inflight_thread_count_++;
+  std::thread response_thread([this, factory_ptr, image_paths, supports_first_dim_batching]() {
+  ResponseThread(factory_ptr, image_paths, supports_first_dim_batching);
+  });
+  response_thread.detach();
+}
+
+
+void ModelInstanceState::ResponseThread(TRITONBACKEND_ResponseFactory* factory_ptr, std::vector<std::string> image_paths, bool supports_first_dim_batching){
+
+  std::unique_ptr<TRITONBACKEND_ResponseFactory, backend::ResponseFactoryDeleter> factory(factory_ptr);
+  TRITONBACKEND_Output* out;
+  TRITONBACKEND_Response* response;
+  RESPOND_FACTORY_AND_RETURN_IF_ERROR(
+    factory.get(), TRITONBACKEND_ResponseNewFromFactory(&response, factory.get()));
+
+  size_t dst_c =  model_state_->TargetShape()[2];
+  size_t dst_h =  model_state_->TargetShape()[0];
+  size_t dst_w =  model_state_->TargetShape()[1];
+  size_t output_size = dst_c * dst_h * dst_w;
+
+  float* data = (float*)malloc(sizeof(float) * output_size * image_paths.size());
+  const int64_t* out_shape;
+  size_t dims;
+  if(supports_first_dim_batching){
+    out_shape = new int64_t[]{int64_t(image_paths.size()), int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
+    dims = model_state_->TargetShape().size() + 1;
+  }else{
+    out_shape = new int64_t[]{int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
+    dims = model_state_->TargetShape().size();
+  }
+
+  RESPOND_FACTORY_AND_RETURN_IF_ERROR(
+    factory.get(), TRITONBACKEND_ResponseOutput(
+    response, &out, "image", TRITONSERVER_TYPE_FP32, out_shape, dims));
+  delete []out_shape;
+  void* out_buffer;
+  TRITONSERVER_MemoryType out_memory_type = TRITONSERVER_MEMORY_CPU;
+  int64_t out_memory_type_id = 0;
+
+  RESPOND_FACTORY_AND_RETURN_IF_ERROR(
+        factory.get(), TRITONBACKEND_OutputBuffer(
+                           out, &out_buffer, sizeof(float) * output_size * image_paths.size(), &out_memory_type,
+                           &out_memory_type_id));
+
+  if (out_memory_type == TRITONSERVER_MEMORY_GPU) {
+      RESPOND_FACTORY_AND_RETURN_IF_ERROR(
+          factory.get(),
+          TRITONSERVER_ErrorNew(
+              TRITONSERVER_ERROR_INTERNAL,
+              "failed to create OUT output buffer in CPU memory"));
+  }
+  for(size_t ii=0; ii < image_paths.size(); ii++){
+    std::string image_path = image_paths[ii];
+    cv::Mat img = cv::imread(image_path);
+    cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+    cv::Mat chw = hwc2chw(img);
+    size_t src_mem_size = sizeof(uchar) * img.rows * img.cols * img.channels();
+    size_t dst_mem_size = sizeof(float) * dst_h * dst_w * dst_c;
+    float *norm_data = (float*)malloc(dst_mem_size);
+    uchar *img_cuda;
+    float *norm_data_cuda;
+    cudaMalloc((void **)&img_cuda, src_mem_size);
+    cudaMalloc((void **)&norm_data_cuda, dst_mem_size);
+    cudaMemcpy(img_cuda, chw.data, src_mem_size, cudaMemcpyHostToDevice);
+    RGB_CropNorm(img_cuda, norm_data_cuda,  RectI{0, 0, img.cols, img.rows}, Shape2DI{img.cols, img.rows}, Shape2DI{int(dst_w), int(dst_h)}, 
+                  Point3DF{model_state->NormMean().x, model_state->NormMean().y, model_state->NormMean().z}, 
+                  Point3DF{model_state->NormStd().x, model_state->NormStd().y, model_state->NormStd().z}, nullptr);
+    cudaMemcpy(norm_data, norm_data_cuda, dst_mem_size, cudaMemcpyDeviceToHost);
+    int dst_size = dst_h * dst_w;
+    std::vector<float> r(norm_data, norm_data + dst_size);
+    std::vector<float> g(norm_data + dst_size, norm_data + dst_size * 2);
+    std::vector<float> b(norm_data + dst_size *2, norm_data + dst_size * 3);
+    cv::Mat matArray[] = {cv::Mat(dst_h, dst_w, CV_32FC1, r.data()), cv::Mat(dst_h, dst_w, CV_32FC1, g.data()), cv::Mat(dst_h, dst_w, CV_32FC1, b.data())};
+    cv::Mat merge_image;
+    cv::merge(matArray, 3, merge_image);
+    memcpy(data + output_size * ii, reinterpret_cast<float*>(merge_image.data), sizeof(float) * output_size);
+  }
+  memcpy(out_buffer, data, sizeof(float) * output_size * image_paths.size());
+  LOG_IF_ERROR(
+          TRITONBACKEND_ResponseSend(
+              response, TRITONSERVER_RESPONSE_COMPLETE_FINAL /* flags */, nullptr /* success */),
+          "failed sending response");
+  inflight_thread_count_--;
 }
 
 extern "C" {
@@ -359,62 +583,9 @@ TRITONBACKEND_ModelInstanceFinalize(TRITONBACKEND_ModelInstance* instance)
   return nullptr;  // success
 }
 
-}  
-
-bool isFileExists_access(std::string name) {
-    return (access(name.c_str(), F_OK ) != -1 );
-}
+} 
 
 extern "C" {
-
-TRITONSERVER_Error* FindVaildPath(const char * char_arr, size_t& char_byte_size, bool supports_first_dim_batching, std::vector<std::string>& image_paths){
-  if(supports_first_dim_batching){
-    size_t ii=0;
-    size_t start_idx = 0;
-    while(ii < char_byte_size){
-      if(char_arr[ii] == '/'){
-        start_idx = ii;
-        while((ii + 3) < char_byte_size){
-          if(std::string(char_arr + ii + 1, char_arr + ii + 4) == "jpg"){
-            std::string file_path = std::string(char_arr + start_idx, char_arr + ii + 4);
-            if(!isFileExists_access(file_path)){
-              return TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_NOT_FOUND,
-            "input file path not exists");
-            }
-            image_paths.push_back(file_path);
-            ii = ii + 4;
-            break;
-          }else{
-            ii ++;
-          }
-        }
-      }
-      ii ++;
-    }
-  }else{
-    size_t ii =0; 
-    for(; ii< char_byte_size; ii++){
-      if(char_arr[ii] == '/'){
-        break;
-      }
-    }
-    std::string s(char_arr + ii, char_arr + char_byte_size);
-    image_paths.push_back(s);
-  }
-  return nullptr;
-}
-
-cv::Mat hwc2chw(cv::Mat image){
-    std::vector<cv::Mat> rgb_images;
-    cv::split(image, rgb_images);
-    cv::Mat m_flat_r = rgb_images[0].reshape(1,1);
-    cv::Mat m_flat_g = rgb_images[1].reshape(1,1);
-    cv::Mat m_flat_b = rgb_images[2].reshape(1,1);
-    cv::Mat matArray[] = { m_flat_r, m_flat_g, m_flat_b};
-    cv::Mat flat_image;
-    cv::hconcat(matArray, 3, flat_image);
-    return flat_image;
-}
 
 TRITONSERVER_Error*
 TRITONBACKEND_ModelInstanceExecute(
@@ -429,131 +600,21 @@ TRITONBACKEND_ModelInstanceExecute(
   RETURN_IF_ERROR(TRITONBACKEND_ModelInstanceState(
       instance, reinterpret_cast<void**>(&instance_state)));
   ModelState* model_state = instance_state->StateForModel();
-
-  std::vector<TRITONBACKEND_Response*> responses;
-  responses.reserve(request_count);
-  for (uint32_t r = 0; r < request_count; ++r) {
-    TRITONBACKEND_Request* request = requests[r];
-    TRITONBACKEND_Response* response;
-    RETURN_IF_ERROR(TRITONBACKEND_ResponseNew(&response, request));
-    responses.push_back(response);
-  }
-
-  BackendInputCollector collector(
-      requests, request_count, &responses, model_state->TritonMemoryManager(),
-      false /* pinned_enabled */, nullptr /* stream*/);
-
-  std::vector<std::pair<TRITONSERVER_MemoryType, int64_t>> allowed_input_types =
-      {{TRITONSERVER_MEMORY_CPU_PINNED, 0}, {TRITONSERVER_MEMORY_CPU, 0}};
-  const char* input_buffer;
-  size_t input_buffer_byte_size;
-  TRITONSERVER_MemoryType input_buffer_memory_type;
-  int64_t input_buffer_memory_type_id;
-  RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-      responses, request_count,
-      collector.ProcessTensor(
-          model_state->InputTensorName().c_str(), nullptr /* existing_buffer */,
-          0 /* existing_buffer_byte_size */, allowed_input_types, &input_buffer,
-          &input_buffer_byte_size, &input_buffer_memory_type,
-          &input_buffer_memory_type_id));
-  const bool need_cuda_input_sync = collector.Finalize();
-  if (need_cuda_input_sync) {
-    LOG_MESSAGE(
-        TRITONSERVER_LOG_ERROR,
-        "'recommended' backend: unexpected CUDA sync required by collector");
-  }
+  bool supports_first_dim_batching;
+  model_state->SupportsFirstDimBatching(&supports_first_dim_batching);
 
   uint64_t compute_start_ns = 0;
   SET_TIMESTAMP(compute_start_ns);
-  bool supports_first_dim_batching;
-  RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-      responses, request_count,
-      model_state->SupportsFirstDimBatching(&supports_first_dim_batching));
-  std::vector<std::string> image_paths;
-  RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-      responses, request_count,
-    FindVaildPath(input_buffer, input_buffer_byte_size, supports_first_dim_batching, image_paths));
-  LOG_MESSAGE(
-      TRITONSERVER_LOG_INFO,
-      (std::string("model ") + model_state->Name() + ": requests count: " +
-       std::to_string(request_count) + "batchsize:" + std::to_string(image_paths.size()))
-          .c_str());
-
-  size_t dst_c =  model_state->TargetShape()[2];
-  size_t dst_h =  model_state->TargetShape()[0];
-  size_t dst_w =  model_state->TargetShape()[1];
-  size_t output_size = dst_c * dst_h *dst_w;
-  float* data = (float*)malloc(sizeof(float) * output_size * image_paths.size());
-  for(size_t ii=0; ii < image_paths.size(); ii++){
-    std::string image_path = image_paths[ii];
-    cv::Mat img = cv::imread(image_path);
-    cv::Mat chw = hwc2chw(img);
-    size_t src_mem_size = sizeof(uchar) * img.rows * img.cols * img.channels();
-    size_t dst_mem_size = sizeof(float) * dst_h * dst_w * dst_c;
-    float *norm_data = (float*)malloc(dst_mem_size);
-    uchar *img_cuda;
-    float *norm_data_cuda;
-
-    cudaMalloc((void **)&img_cuda, src_mem_size);
-    cudaMalloc((void **)&norm_data_cuda, dst_mem_size);
-    cudaMemcpy(img_cuda, chw.data, src_mem_size, cudaMemcpyHostToDevice);
-    RGB_CropNorm(img_cuda, norm_data_cuda,  RectI{0, 0, img.cols, img.rows}, Shape2DI{img.cols, img.rows}, Shape2DI{int(dst_w), int(dst_h)}, Point3DF{0.0, 0.0, 0.0}, Point3DF{1.0, 1.0, 1.0}, nullptr);
-    cudaMemcpy(norm_data, norm_data_cuda, dst_mem_size, cudaMemcpyDeviceToHost);
-
-    int dst_size = dst_h * dst_w;
-    std::vector<float> r(norm_data, norm_data + dst_size);
-    std::vector<float> g(norm_data + dst_size, norm_data + dst_size * 2);
-    std::vector<float> b(norm_data + dst_size *2, norm_data + dst_size * 3);
-    cv::Mat matArray[] = {cv::Mat(dst_h, dst_w, CV_32FC1, r.data()), cv::Mat(dst_h, dst_w, CV_32FC1, g.data()), cv::Mat(dst_h, dst_w, CV_32FC1, b.data())};
-    cv::Mat merge_image;
-    cv::merge(matArray, 3, merge_image);
-    cv::imwrite("r.jpg", matArray[0]);
-    cv::imwrite("g.jpg", matArray[1]);
-    cv::imwrite("b.jpg", matArray[2]);
-    cv::imwrite("processed.jpg", merge_image);
-    memcpy(data + output_size * ii, merge_image.data, sizeof(float) * output_size);
+  for(uint32_t r= 0; r < request_count; ++r){
+    TRITONBACKEND_Request* request = requests[r];
+    instance_state->ProcessRequest(request, supports_first_dim_batching);
   }
-
-  const char* output_buffer = reinterpret_cast<const char *>(data);
-  TRITONSERVER_MemoryType output_buffer_memory_type = TRITONSERVER_MEMORY_CPU;
-  int64_t output_buffer_memory_type_id = 0;
+  
   uint64_t compute_end_ns = 0;
   SET_TIMESTAMP(compute_end_ns);
-  std::vector<int64_t> tensor_shape;
-  RESPOND_ALL_AND_SET_NULL_IF_ERROR(
-      responses, request_count, model_state->TensorShape(tensor_shape));
-  if(supports_first_dim_batching){
-    tensor_shape.insert(tensor_shape.begin(), image_paths.size());
-  }
-  BackendOutputResponder responder(
-      requests, request_count, &responses, model_state->TritonMemoryManager(),
-      supports_first_dim_batching, false /* pinned_enabled */,
-      nullptr /* stream*/);
-
-  responder.ProcessTensor(
-      model_state->OutputTensorName(), model_state->TensorOutDataType(),
-      tensor_shape, output_buffer, output_buffer_memory_type,
-      output_buffer_memory_type_id);
-
-  const bool need_cuda_output_sync = responder.Finalize();
-  if (need_cuda_output_sync) {
-    LOG_MESSAGE(
-        TRITONSERVER_LOG_ERROR,
-        "'recommended' backend: unexpected CUDA sync required by responder");
-  }
-  for (auto& response : responses) {
-    if (response != nullptr) {
-      LOG_IF_ERROR(
-          TRITONBACKEND_ResponseSend(
-              response, TRITONSERVER_RESPONSE_COMPLETE_FINAL, nullptr),
-          "failed to send response");
-    }
-  }
-
   uint64_t exec_end_ns = 0;
   SET_TIMESTAMP(exec_end_ns);
 
-#ifdef TRITON_ENABLE_STATS
   size_t total_batch_size = 0;
   if (!supports_first_dim_batching) {
     total_batch_size = request_count;
@@ -576,43 +637,27 @@ TRITONBACKEND_ModelInstanceExecute(
       }
     }
   }
-#else
-  (void)exec_start_ns;
-  (void)exec_end_ns;
-  (void)compute_start_ns;
-  (void)compute_end_ns;
-#endif  // TRITON_ENABLE_STATS
 
-  // Report statistics for each request, and then release the request.
   for (uint32_t r = 0; r < request_count; ++r) {
     auto& request = requests[r];
-
-#ifdef TRITON_ENABLE_STATS
     LOG_IF_ERROR(
         TRITONBACKEND_ModelInstanceReportStatistics(
             instance_state->TritonModelInstance(), request,
-            (responses[r] != nullptr) /* success */, exec_start_ns,
+            true /*success */, exec_start_ns,
             compute_start_ns, compute_end_ns, exec_end_ns),
         "failed reporting request statistics");
-#endif  // TRITON_ENABLE_STATS
-
     LOG_IF_ERROR(
         TRITONBACKEND_RequestRelease(request, TRITONSERVER_REQUEST_RELEASE_ALL),
         "failed releasing request");
   }
-
-#ifdef TRITON_ENABLE_STATS
-  // Report batch statistics.
   LOG_IF_ERROR(
       TRITONBACKEND_ModelInstanceReportBatchStatistics(
           instance_state->TritonModelInstance(), total_batch_size,
           exec_start_ns, compute_start_ns, compute_end_ns, exec_end_ns),
       "failed reporting batch request statistics");
-#endif  // TRITON_ENABLE_STATS
-
   return nullptr;  // success
 }
 
 }  // extern "C"
 
-}}}  // namespace triton::backend::recommended
+}}}  // namespace triton::backend::image_process
