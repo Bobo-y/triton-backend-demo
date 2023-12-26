@@ -1,3 +1,5 @@
+# This is a demo of triton-inference-server custom backend. This backend get images path from http/grpc then return resized and normlized tensor. For resize and norm image, you can choose opencv or cuda kernel. 
+
 1. build custom backend
 
 ```shell
