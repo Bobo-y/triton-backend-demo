@@ -12,8 +12,7 @@ cd build
 cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install ..
 make install -j8
 
-# the cuda version not work now.
-# for debug cuda kernel
+# for debug cuda kernel, your docker cuda version should lower than your host machine
 mv image_process.cc image_process.cc.bak
 mv image_process_cuda.cc  image_process.cc
 mkdir build
