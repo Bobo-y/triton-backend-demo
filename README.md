@@ -5,16 +5,21 @@
 ```shell
 sudo docker build -t serving-triton .
 sudo docker run --gpus all -it -v /home/:/home/ -p 8000:8000 -p 8001:8001 -p 8002:8002 serving-triton  /bin/bash
+```
 
-
+cpu version
+```shell
 # cd image_process dir
 # in docker
 mkdir build
 cd build
 cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install ..
 make install -j8
+```
 
-# for debug cuda kernel, your docker cuda version should lower than your host machine
+cuda version, for cuda kernel, your docker cuda version should lower than your host machine
+
+```shell
 mv image_process.cc image_process.cc.bak
 mv image_process_cuda.cc  image_process.cc
 mkdir build
