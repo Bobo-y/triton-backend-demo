@@ -20,9 +20,12 @@ make install -j8
 cuda version, for cuda kernel, your docker cuda version should lower than your host machine
 
 ```shell
+# cd image_process dir
+# in docker
 mv image_process.cc image_process.cc.bak
 mv image_process_cuda.cc  image_process.cc
 mkdir build
+cd build
 cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install ..
 make install -j8
 ```
