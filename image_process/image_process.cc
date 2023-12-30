@@ -473,10 +473,10 @@ void ModelInstanceState::ResponseThread(TRITONBACKEND_ResponseFactory* factory_p
   const int64_t* out_shape;
   size_t dims;
   if(supports_first_dim_batching){
-    out_shape = new int64_t[]{int64_t(image_paths.size()), int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
+    out_shape = new int64_t[4]{int64_t(image_paths.size()), int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
     dims = model_state_->TargetShape().size() + 1;
   }else{
-    out_shape = new int64_t[]{int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
+    out_shape = new int64_t[3]{int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
     dims = model_state_->TargetShape().size();
   }
 
