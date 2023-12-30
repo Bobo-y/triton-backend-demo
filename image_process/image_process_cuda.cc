@@ -486,10 +486,10 @@ void ModelInstanceState::ResponseThread(TRITONBACKEND_ResponseFactory* factory_p
   const int64_t* out_shape;
   size_t dims;
   if(supports_first_dim_batching){
-    out_shape = new int64_t[]{int64_t(image_paths.size()), int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
+    out_shape = new int64_t[4]{int64_t(image_paths.size()), int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
     dims = model_state_->TargetShape().size() + 1;
   }else{
-    out_shape = new int64_t[]{int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
+    out_shape = new int64_t[3]{int64_t(dst_h), int64_t(dst_w), int64_t(dst_c)};
     dims = model_state_->TargetShape().size();
   }
 
@@ -527,8 +527,8 @@ void ModelInstanceState::ResponseThread(TRITONBACKEND_ResponseFactory* factory_p
     cudaMalloc((void **)&norm_data_cuda, dst_mem_size);
     cudaMemcpy(img_cuda, chw.data, src_mem_size, cudaMemcpyHostToDevice);
     RGB_CropNorm(img_cuda, norm_data_cuda,  RectI{0, 0, img.cols, img.rows}, Shape2DI{img.cols, img.rows}, Shape2DI{int(dst_w), int(dst_h)}, 
-                  Point3DF{model_state->NormMean().x, model_state->NormMean().y, model_state->NormMean().z}, 
-                  Point3DF{model_state->NormStd().x, model_state->NormStd().y, model_state->NormStd().z}, nullptr);
+                  Point3DF{model_state_->NormMean().x, model_state_->NormMean().y, model_state_->NormMean().z}, 
+                  Point3DF{model_state_->NormStd().x, model_state_->NormStd().y, model_state_->NormStd().z}, nullptr);
     cudaMemcpy(norm_data, norm_data_cuda, dst_mem_size, cudaMemcpyDeviceToHost);
     int dst_size = dst_h * dst_w;
     std::vector<float> r(norm_data, norm_data + dst_size);
