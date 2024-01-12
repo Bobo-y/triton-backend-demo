@@ -538,8 +538,12 @@ void ModelInstanceState::ResponseThread(TRITONBACKEND_ResponseFactory* factory_p
     cv::Mat merge_image;
     cv::merge(matArray, 3, merge_image);
     memcpy(data + output_size * ii, reinterpret_cast<float*>(merge_image.data), sizeof(float) * output_size);
+    cudaFree(norm_data_cuda);
+    cudaFree(img_cuda);
+    free(norm_data);
   }
   memcpy(out_buffer, data, sizeof(float) * output_size * image_paths.size());
+  free(data);
   LOG_IF_ERROR(
           TRITONBACKEND_ResponseSend(
               response, TRITONSERVER_RESPONSE_COMPLETE_FINAL /* flags */, nullptr /* success */),
